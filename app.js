@@ -1,4 +1,4 @@
-import { db } from "./firebase.js";
+import { db } from "firebase.js";
 import { doc, getDoc, setDoc, updateDoc, arrayUnion } from "firebase/firestore";
 
 // ========================
