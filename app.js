@@ -1,9 +1,123 @@
 import { db } from "./firebase.js";
-import { doc, getDoc, setDoc, updateDoc, arrayUnion } from "firebase/firestore";
+import { doc, getDoc, setDoc, updateDoc, arrayUnion, increment } from "firebase/firestore";
 
 // ========================
-// UPLOAD WORDS (FIXED FOR SPECIAL CHARACTERS)
+// CONFIGURATION CONSTANTS
 // ========================
+// Number of brand-new words to include in each batch
+const NEW_BATCH_SIZE = 50;
+// Number of review words (mixed difficulty) to include in each batch
+const MIX_SIZE = 50;
+// Threshold for considering a word "mastered" without ever clicking it
+const MASTER_THRESHOLD = 20;      
+// Threshold for considering a word "mastered" after clicking
+const REVIEW_THRESHOLD = 20;      
+
+// ========================
+// HELPER FUNCTIONS
+// ========================
+
+/**
+ * Randomly picks up to n elements from an array without repeats.
+ * @param {Array} arr - Source array
+ * @param {number} n - Number to pick
+ * @returns {Array} - Random subset
+ */
+function pickRandom(arr, n) {
+  const copy = [...arr];
+  const picked = [];
+  while (picked.length < n && copy.length) {
+    const idx = Math.floor(Math.random() * copy.length);
+    picked.push(copy.splice(idx, 1)[0]);
+  }
+  return picked;
+}
+
+/**
+ * Selects 100 words for spaced repetition based on five categories:
+ * 1. unseen (never shown)
+ * 2. seen but unclicked (shown < MASTER_THRESHOLD times, never clicked)
+ * 3. clicked-in-learning (clicked, but exposures since last click < REVIEW_THRESHOLD)
+ * 4. mastered by repetition (shown >= MASTER_THRESHOLD, never clicked)
+ * 5. mastered by review (clicked, exposures since last click >= REVIEW_THRESHOLD)
+ * 
+ * Always excludes mastered words from the selection.
+ * Prioritizes: Unseen → Seen-unclicked → Clicked-in-learning
+ */
+function selectSpacedRepetitionWords(allWords, storyUsage = {}, clickCount = {}, lastClickUsage = {}) {
+  // 1️⃣ Categorize words based on usage and click stats
+  const unseen = allWords.filter(w => (storyUsage[w] || 0) === 0);
+  const seenUnclicked = allWords.filter(w =>
+    (storyUsage[w] || 0) > 0 && storyUsage[w] < MASTER_THRESHOLD && (clickCount[w] || 0) === 0
+  );
+  const clickedInLearning = allWords.filter(w =>
+    (clickCount[w] || 0) > 0 && (storyUsage[w] - (lastClickUsage[w] || 0)) < REVIEW_THRESHOLD
+  );
+  const masteredByRepetition = allWords.filter(w =>
+    (storyUsage[w] || 0) >= MASTER_THRESHOLD && (clickCount[w] || 0) === 0
+  );
+  const masteredByReview = allWords.filter(w =>
+    (clickCount[w] || 0) > 0 && (storyUsage[w] - (lastClickUsage[w] || 0)) >= REVIEW_THRESHOLD
+  );
+
+  // 📊 Log category counts for your review
+  console.log(`Unseen: ${unseen.length}, Seen-Unclicked: ${seenUnclicked.length}, Clicked-In-Learning: ${clickedInLearning.length}, Mastered (Rep): ${masteredByRepetition.length}, Mastered (Review): ${masteredByReview.length}`);
+
+  // 2️⃣ Remove mastered words from further available options
+  const available = allWords.filter(w =>
+    !masteredByRepetition.includes(w) && !masteredByReview.includes(w)
+  );
+
+  // 3️⃣ Pick brand-new words (50 ideally)
+  const batchNew = pickRandom(unseen, Math.min(unseen.length, NEW_BATCH_SIZE));
+
+  // 4️⃣ Prepare review candidates (sort Clicked-in-Learning by clickCount ascending)
+  const sortedClicked = clickedInLearning.sort((a, b) =>
+    (clickCount[a] || 0) - (clickCount[b] || 0)
+  );
+  const third = Math.ceil(sortedClicked.length / 3);
+  const hard   = sortedClicked.slice(0, third);
+  const medium = sortedClicked.slice(third, 2 * third);
+  const easy   = sortedClicked.slice(2 * third);
+
+  // 5️⃣ Pick review words: 20 Hard, 20 Medium, 10 Easy (as per MIX_SIZE split)
+  const hardPick   = pickRandom(hard,   Math.min(hard.length,   20));
+  const mediumPick = pickRandom(medium, Math.min(medium.length, 20));
+  const easyPick   = pickRandom(easy,   Math.min(easy.length,   10));
+
+  // 6️⃣ Combine new + review picks
+  let selectedWords = [...batchNew, ...hardPick, ...mediumPick, ...easyPick];
+
+  // 7️⃣ If total is < 100, fill remaining with fallback precedence:
+  // Unseen → Seen-Unclicked → Clicked-in-Learning (rest) → optionally mastered
+  if (selectedWords.length < 100) {
+    const remaining = 100 - selectedWords.length;
+
+    // Fallback pool in order of precedence
+    const fallbackPool = [
+      ...unseen.filter(w => !selectedWords.includes(w)),
+      ...seenUnclicked.filter(w => !selectedWords.includes(w)),
+      ...clickedInLearning.filter(w => !selectedWords.includes(w))
+    ];
+
+    // Add remaining words from fallback pool
+    selectedWords = [
+      ...selectedWords,
+      ...pickRandom(fallbackPool, Math.min(fallbackPool.length, remaining))
+    ];
+  }
+
+  // 8️⃣ Return final batch (might still be < 100 if pool is too small)
+  return selectedWords;
+}
+
+
+// ========================
+// UPLOAD WORDS HANDLER
+// ========================
+// Reads an uploaded text file, normalizes special chars, splits into words,
+// deduplicates, and stores unique entries in Firestore 'wordBank'.
+
 document.getElementById('uploadWords').addEventListener('click', async () => {
   try {
     const fileInput = document.getElementById('wordFile');
@@ -13,169 +127,196 @@ document.getElementById('uploadWords').addEventListener('click', async () => {
       return;
     }
 
-    const text = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = e => resolve(e.target.result);
-      reader.onerror = reject;
-      reader.readAsText(file, 'UTF-8');
-    });
+    // Read as ArrayBuffer then decode to UTF-8 string
+    const buffer = await file.arrayBuffer();
+    let text = new TextDecoder('utf-8').decode(buffer);
+    // Remove BOM if present
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    // Normalize to NFC for combined characters
+    text = text.normalize('NFC');
 
     const newWords = text
-      .normalize('NFKC')
-      .split(/[\r\n,;|]+/)
-      .map(word => word.trim())
-      .filter(word => word.length > 0);
-
-    console.log("First 10 words:", newWords.slice(0, 10));
-
-    const hasSpecialChars = newWords.some(word => /[äöüß]/i.test(word));
-    console.log(hasSpecialChars ? "✅ Special characters detected" : "⚠️ No special characters found");
-
-    if (newWords.length === 0) {
-      alert('No valid words found. Separate words with line breaks or commas.');
-      return;
-    }
+      .split(/\r?\n|[,;|]+/)   // newline or comma/semicolon/pipe
+      .map(w => w.trim())
+      .filter(w => w.length > 0);
 
     const wordBankRef = doc(db, 'meta', 'wordBank');
     const wordBankSnap = await getDoc(wordBankRef);
 
     if (wordBankSnap.exists()) {
-      const existingWords = wordBankSnap.data().words || [];
-      const uniqueNewWords = newWords.filter(word => !existingWords.includes(word));
-      if (uniqueNewWords.length === 0) {
-        alert('All words already exist in the word bank.');
+      const existing = wordBankSnap.data().words || [];
+      const unique = newWords.filter(w => !existing.includes(w));
+      if (!unique.length) {
+        alert('All words already exist.');
         return;
       }
-      await updateDoc(wordBankRef, {
-        words: arrayUnion(...uniqueNewWords)
-      });
-      alert(`${uniqueNewWords.length} new words added! Total: ${existingWords.length + uniqueNewWords.length}`);
+      await updateDoc(wordBankRef, { words: arrayUnion(...unique) });
+      alert(`${unique.length} new words added!`);
     } else {
       await setDoc(wordBankRef, { words: newWords });
-      alert(`New word list created with ${newWords.length} words!`);
+      alert(`Word bank created with ${newWords.length} words!`);
     }
-  } catch (error) {
-    console.error('Upload error:', error);
-    alert(`Error: ${error.message}`);
+  } catch (e) {
+    console.error('Upload error:', e);
+    alert(`Error: ${e.message}`);
   }
 });
 
 // ========================
-// FETCH WORDS AND GENERATE STORY
+// FETCH & GENERATE STORY HANDLER
 // ========================
+// Retrieves wordBank + stats, selects 100 words, updates usage counts,
+// and calls generateStory()
+
 document.getElementById('fetchWords').addEventListener('click', async () => {
   try {
-    const wordBankRef = doc(db, 'meta', 'wordBank');
-    const wordBankSnap = await getDoc(wordBankRef);
-    if (!wordBankSnap.exists()) {
-      alert('No word bank found. Please upload words first.');
-      return;
+    // Load master word list
+    const wordBankSnap = await getDoc(doc(db, 'meta', 'wordBank'));
+    if (!wordBankSnap.exists()) return alert('Upload words first.');
+
+    const allWords = (wordBankSnap.data().words || [])
+      .map(w => typeof w === 'string' ? w.normalize('NFKC') : '')
+      .filter(w => w.length);
+
+    // Load or initialize stats
+    const statsRef = doc(db, 'meta', 'wordStats');
+    const statsSnap = await getDoc(statsRef);
+    const stats = statsSnap.exists() ? statsSnap.data() : {};
+    const storyUsage     = stats.storyUsage     || {};
+    const clickCount     = stats.clickCount     || {};
+    const lastClickUsage = stats.lastClickUsage || {};
+
+    // Ensure enough words available
+    if (allWords.length < NEW_BATCH_SIZE + MIX_SIZE) {
+      return alert(`Need at least ${NEW_BATCH_SIZE + MIX_SIZE} words (have ${allWords.length}).`);
     }
 
-    const wordsArray = (wordBankSnap.data().words || [])
-      .map(word => typeof word === 'string' ? word.normalize('NFKC') : '')
-      .filter(word => word.length > 0);
+    // Select 100 words based on spaced repetition logic
+    const selected = selectSpacedRepetitionWords(allWords, storyUsage, clickCount, lastClickUsage);
 
-    console.log('Total words:', wordsArray.length);
+    // Increment storyUsage for each selected word
+    const usageUpdates = selected.reduce((acc, w) => ({
+      ...acc,
+      [`storyUsage.${w}`]: increment(1)
+    }), {});
+    if (statsSnap.exists()) await updateDoc(statsRef, usageUpdates);
+    else await setDoc(statsRef, { storyUsage: selected.reduce((o, w) => ({ ...o, [w]: 1 }), {}), clickCount: {}, lastClickUsage: {} });
 
-    const specialCharWords = wordsArray.filter(word => /[äöüß]/i.test(word));
-    console.log('Words with special characters:', specialCharWords.slice(0, 10));
-
-    if (wordsArray.length < 100) {
-      alert(`Minimum 100 words required (currently: ${wordsArray.length}).`);
-      return;
-    }
-
-    const randomWords = [...wordsArray]
-      .sort(() => 0.5 - Math.random())
-      .slice(0, 100);
-
+    // Show loading message, then generate and display story
     document.getElementById('story').innerText = "Generating story...";
-    const story = await generateStory(randomWords);
-
+    const story = await generateStory(selected);
     displaySelectableStory(story);
 
-  } catch (error) {
-    console.error('Error:', error);
-    document.getElementById('story').innerText = `Error: ${error.message}`;
+  } catch (e) {
+    console.error('Fetch error:', e);
+    document.getElementById('story').innerText = `Error: ${e.message}`;
   }
 });
 
 // ========================
-// GEMINI STORY GENERATION
+// GEMINI STORY GENERATION FUNCTION
 // ========================
+// Sends a POST request to Google Gemini API with a prompt using only selected words
+
 async function generateStory(words) {
   try {
-    const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-    if (!apiKey) throw new Error('API key missing');
+    const key = import.meta.env.VITE_GEMINI_API_KEY;
+    if (!key) throw new Error('API key missing');
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
-
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`;
     const prompt = `Write a short, meaningful and coherent story in present tense in German. You are only allowed to use the following 
                   words: ${words.join(', ')}. Do not include any other words outside this list. The story should 
                   be 13 lines and in 2 passages. It should read like a story, not some bundled up sentences.
-                  Important: Use correct German spelling, including umlauts (ä, ö, ü, ß) wherever appropriate.`;
+                  Important: Use correct German spelling, including umlauts (ä, ö, ü, ß).`;
 
-    const response = await fetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }]
-      })
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
     });
 
-    const data = await response.json();
+    const data = await res.json();
     return data.candidates?.[0]?.content?.parts?.[0]?.text || "No story generated.";
-  } catch (error) {
-    console.error('API error:', error);
-    return `Error: ${error.message}`;
+  } catch (e) {
+    console.error('API error:', e);
+    return `Error: ${e.message}`;
   }
 }
 
 // ========================
-// DISPLAY STORY WITH SELECTABLE WORDS
+// UTILITY: Strip punctuation from a word
 // ========================
-function displaySelectableStory(storyText) {
-  const storyContainer = document.getElementById('story');
-  storyContainer.innerHTML = "";
+function sanitizeWord(word) {
+  return word.replace(/[\p{P}\p{S}]+/gu, "").trim();
+}
 
-  // Split story by spaces and wrap each word in a <span>
-  const words = storyText.split(/\s+/);
+// ========================
+// DISPLAY STORY FUNCTION (updated)
+// ========================
+function displaySelectableStory(text) {
+  const cont = document.getElementById('story');
+  cont.innerHTML = '';
+  cont.style.whiteSpace = 'normal';
+  cont.style.overflowWrap = 'anywhere';
+  cont.style.wordBreak = 'break-word';
 
-  words.forEach((word, index) => {
-    const span = document.createElement('span');
-    span.innerText = word + " ";
-    span.style.cursor = 'pointer';
-    span.style.userSelect = 'none';
-    span.style.padding = '2px 4px';
-    span.style.borderRadius = '4px';
-    span.addEventListener('click', () => handleWordClick(word));
-    span.addEventListener('mouseover', () => {
-      span.style.backgroundColor = '#eef';
-    });
-    span.addEventListener('mouseout', () => {
-      span.style.backgroundColor = '';
-    });
-    storyContainer.appendChild(span);
+  // Split on whitespace but retain punctuation on the span text
+  text.split(/(\s+)/).forEach(token => {
+    if (!token.trim()) {
+      // whitespace: add as text node
+      cont.appendChild(document.createTextNode(token));
+    } else {
+      // word or punctuation
+      const s = document.createElement('span');
+      s.innerText = token;
+      s.style.cursor = 'pointer';
+      s.style.userSelect = 'none';
+      s.style.padding = '2px 4px';
+      s.style.borderRadius = '4px';
+      
+      s.addEventListener('click', () => {
+        // sanitize before sending to database
+        const clicked = sanitizeWord(token);
+        if (clicked) handleWordClick(clicked);
+      });
+      s.addEventListener('mouseover', () => s.style.backgroundColor = '#eef');
+      s.addEventListener('mouseout', () => s.style.backgroundColor = '');
+      cont.appendChild(s);
+    }
   });
 }
 
 // ========================
-// HANDLE WORD CLICK
+// HANDLE WORD CLICK FUNCTION (updated)
 // ========================
-async function handleWordClick(word) {
+async function handleWordClick(rawWord) {
+  const word = sanitizeWord(rawWord);
+  if (!word) return;  // nothing to do if only punctuation
+
+  const statsRef = doc(db, 'meta', 'wordStats');
+  const statsSnap = await getDoc(statsRef);
+  const stats = statsSnap.exists() ? statsSnap.data() : {};
+  const storyUsage = stats.storyUsage || {};
+
   try {
-    const wordClicksRef = doc(db, 'meta', 'wordClicks');
-    await updateDoc(wordClicksRef, {
-      clicks: arrayUnion(word)
+    await updateDoc(statsRef, {
+      // bump click count by 1
+      [`clickCount.${word}`]: increment(1),
+      // record current usage count as "last clicked at"
+      [`lastClickUsage.${word}`]: storyUsage[word] || 0
     });
-    console.log(`✅ Word clicked: ${word}`);
-  } catch (error) {
-    if (error.code === 'not-found') {
-      await setDoc(doc(db, 'meta', 'wordClicks'), { clicks: [word] });
-      console.log(`✅ Word click document created and word logged: ${word}`);
-    } else {
-      console.error('Click logging error:', error);
-    }
+    console.log(`✅ Clicked: ${word}`);
+  } catch (e) {
+    if (e.code === 'not-found') {
+      // initialize stats doc if missing
+      await setDoc(statsRef, {
+        storyUsage: {},
+        clickCount: { [word]: 1 },
+        lastClickUsage: { [word]: storyUsage[word] || 0 }
+      });
+      console.log(`✅ Created stats and set click for ${word}`);
+    } else console.error('Click error:', e);
   }
 }
+
+
