@@ -1,7 +1,7 @@
 import { doc, getDoc, setDoc, updateDoc, arrayUnion } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import { db } from "./firebase.js";
 
-import Papa from 'papaparse';
+
 
 
 // ========================
