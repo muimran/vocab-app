@@ -27,6 +27,6 @@ jobs:
       - name: Deploy to Firebase Hosting
         uses: w9jds/firebase-action@v13.4.0
         with:
-          args: deploy --only hosting
+          args: deploy --only hosting --project vocabapp-105be
         env:
           FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
