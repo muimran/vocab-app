@@ -1,19 +1,18 @@
 <!DOCTYPE html>
 <html>
-<head>
-  <title>Vocab App</title>
-</head>
-<body>
-  <h1>Upload your word list</h1>
+  <head>
+    <title>Vocab App</title>
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  </head>
+  <body>
+    <h1>Upload your word list</h1>
+    <input type="file" id="wordFile" accept=".txt,.csv" />
+    <button id="uploadWords">Upload Words</button>
 
-  <input type="file" id="wordFile" accept=".txt,.csv" />
+    <h2>Generate Story</h2>
+    <button id="fetchWords">Generate Story</button>
+    <pre id="story"></pre>
 
-  <button id="uploadWords">Upload Words</button>
-
-  <h2>Generate Story</h2>
-  <button id="fetchWords">Generate Story</button>
-  <pre id="story"></pre>
-
-  <script type="module" src="app.js"></script>
-</body>
+    <script src="app.js"></script>
+  </body>
 </html>
