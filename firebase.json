@@ -1,0 +1,16 @@
+{
+  "hosting": {
+    "public": "./",       // Folder to deploy, usually your build output or root folder
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "**",
+        "destination": "/index.html"
+      }
+    ]
+  }
+}
