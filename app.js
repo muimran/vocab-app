@@ -1,5 +1,7 @@
 import { db } from "./firebase.js";
 import { doc, getDoc, setDoc, updateDoc, arrayUnion, increment } from "firebase/firestore";
+import Papa from 'papaparse';
+
 
 // ========================
 // CONFIGURATION CONSTANTS
@@ -127,40 +129,69 @@ document.getElementById('uploadWords').addEventListener('click', async () => {
       return;
     }
 
-    // Read as ArrayBuffer then decode to UTF-8 string
+    const fileExt = file.name.split('.').pop().toLowerCase();
     const buffer = await file.arrayBuffer();
-    let text = new TextDecoder('utf-8').decode(buffer);
-    // Remove BOM if present
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    // Normalize to NFC for combined characters
-    text = text.normalize('NFC');
+    const text = new TextDecoder('utf-8').decode(buffer);
 
-    const newWords = text
-      .split(/\r?\n|[,;|]+/)   // newline or comma/semicolon/pipe
-      .map(w => w.trim())
-      .filter(w => w.length > 0);
+    let newWords = [];
 
-    const wordBankRef = doc(db, 'meta', 'wordBank');
-    const wordBankSnap = await getDoc(wordBankRef);
+    if (fileExt === 'csv') {
+      Papa.parse(text, {
+        delimiter: ";",  // or "," — adjust this as needed
+        header: false,
+        skipEmptyLines: true,
+        complete: function(results) {
+          newWords = results.data.flat().map(w => w.trim()).filter(w => w.length > 0);
+          uploadToFirestore(newWords);  // Call your Firestore function here
+        },
+        error: function(err) {
+          console.error("CSV parsing error:", err);
+          alert(`CSV parsing error: ${err.message}`);
+        }
+      });
+    } else if (fileExt === 'txt') {
+      // Remove BOM if present
+      let cleanText = text;
+      if (cleanText.charCodeAt(0) === 0xFEFF) cleanText = cleanText.slice(1);
+      cleanText = cleanText.normalize('NFC');
 
-    if (wordBankSnap.exists()) {
-      const existing = wordBankSnap.data().words || [];
-      const unique = newWords.filter(w => !existing.includes(w));
-      if (!unique.length) {
-        alert('All words already exist.');
-        return;
-      }
-      await updateDoc(wordBankRef, { words: arrayUnion(...unique) });
-      alert(`${unique.length} new words added!`);
+      newWords = cleanText
+        .split(/\r?\n|[,;|]+/)
+        .map(w => w.trim())
+        .filter(w => w.length > 0);
+
+      await uploadToFirestore(newWords);  // Call your Firestore function here
+
     } else {
-      await setDoc(wordBankRef, { words: newWords });
-      alert(`Word bank created with ${newWords.length} words!`);
+      alert('Unsupported file type. Please upload a .txt or .csv file.');
     }
+
   } catch (e) {
     console.error('Upload error:', e);
     alert(`Error: ${e.message}`);
   }
 });
+
+async function uploadToFirestore(newWords) {
+  const wordBankRef = doc(db, 'meta', 'wordBank');
+  const wordBankSnap = await getDoc(wordBankRef);
+
+  if (wordBankSnap.exists()) {
+    const existing = wordBankSnap.data().words || [];
+    const unique = newWords.filter(w => !existing.includes(w));
+    if (!unique.length) {
+      alert('All words already exist.');
+      return;
+    }
+    await updateDoc(wordBankRef, { words: arrayUnion(...unique) });
+    alert(`${unique.length} new words added!`);
+  } else {
+    await setDoc(wordBankRef, { words: newWords });
+    alert(`Word bank created with ${newWords.length} words!`);
+  }
+}
+
+
 
 // ========================
 // FETCH & GENERATE STORY HANDLER
